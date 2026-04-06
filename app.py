@@ -3,7 +3,6 @@ import pandas as pd
 import json
 import re
 import os
-from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -20,6 +19,15 @@ client = OpenAI(
 )
 
 st.title("🚀 Execution Intelligence Agent")
+
+# -------------------------------
+# SESSION STATE
+# -------------------------------
+if "last_input" not in st.session_state:
+    st.session_state.last_input = None
+
+if "cached_tasks" not in st.session_state:
+    st.session_state.cached_tasks = None
 
 # -------------------------------
 # TEAM DATA
@@ -39,41 +47,24 @@ def is_vague_input(text):
     return len(text.split()) <= 2
 
 
-def extract_deadline_days(text):
-    text = text.lower()
-
-    if "today" in text or "tomorrow" in text:
-        return 1
-    if "week" in text:
-        return 7
-    if "month" in text:
-        return 30
-    if "monday" in text:
-        return 2
-
-    match = re.search(r"(\d+)\s*day", text)
-    if match:
-        return int(match.group(1))
-
-    return None
-
-
-def effort_to_hours(effort):
-    return {"Low": 2, "Medium": 4, "High": 8}.get(effort, 4)
+def normalize_effort(effort):
+    e = str(effort).lower()
+    if "low" in e:
+        return "Low"
+    if "high" in e:
+        return "High"
+    return "Medium"
 
 
 def correct_skill(task, skill):
     t = task.lower()
-
-    if any(x in t for x in ["ui", "layout", "dashboard", "menu"]):
+    if any(x in t for x in ["ui", "layout", "menu", "filter", "dashboard"]):
         return "Frontend"
-    if any(x in t for x in ["data", "metrics", "schema"]):
+    if any(x in t for x in ["data", "metrics"]):
         return "Data"
-
     return skill
 
 
-# 🔥 ASSIGNMENT
 def assign_task(skill, df):
     df_copy = df.copy()
     df_copy["Available"] = df_copy["Capacity"] - df_copy["CurrentTasks"]
@@ -83,33 +74,33 @@ def assign_task(skill, df):
     df_copy["Score"] += df_copy["Available"]
 
     best = df_copy.sort_values(by="Score", ascending=False).iloc[0]
-
     return best["Employee"], best["Available"], "Best fit (skill + availability)"
 
 
-# 🔥 SPLIT TASKS (STEP 1)
 def split_tasks(main_tasks):
     all_subtasks = []
 
     for task in main_tasks:
         try:
             prompt = f"""
-            You are continuing an execution planning task.
+            You are an AI Project Manager.
 
-            DO NOT change domain.
-            Keep tasks simple and within scope.
+            Break the task into smaller implementation tasks.
 
-            Break this task into MAXIMUM 2 subtasks.
+            STRICT RULES:
+            - Maximum 2 subtasks
+            - Use action verbs: Create, Build, Implement, Develop
+            - Do NOT use: Design, Plan, Define, Analyze, Document
+            - Keep tasks simple and executable
+            - Effort must be ONLY: Low, Medium, High
 
             Task: {task['task']}
 
-            Each subtask must include:
+            Respond ONLY in JSON array with:
             - task
             - skill
             - priority
-            - effort (Low / Medium / High)
-
-            Respond ONLY in JSON array.
+            - effort
             """
 
             res = client.chat.completions.create(
@@ -120,8 +111,8 @@ def split_tasks(main_tasks):
 
             raw = res.choices[0].message.content
             match = re.search(r"\[.*\]", raw, re.DOTALL)
-
             subs = json.loads(match.group()) if match else []
+
             all_subtasks.extend(subs)
 
         except:
@@ -130,43 +121,71 @@ def split_tasks(main_tasks):
     return all_subtasks[:3]
 
 
-# 🔥 DEPENDENCIES
 def add_dependencies(tasks):
     for i in range(len(tasks)):
         tasks[i]["depends_on"] = None if i == 0 else tasks[i-1]["task"]
     return tasks
 
 
+def filter_bad_tasks(tasks):
+    banned = [
+        "login", "signup", "authentication",
+        "shutdown", "operating system",
+        "gather", "document", "define", "analyze",
+        "requirement", "stakeholder", "discussion",
+        "design", "plan"
+    ]
+
+    clean = []
+    for t in tasks:
+        text = t.get("task", "").lower()
+        if not any(word in text for word in banned):
+            clean.append(t)
+
+    return clean[:3]
+
+
 # -------------------------------
 # PROMPTS
 # -------------------------------
 MAIN_PROMPT = """
-Generate EXACTLY 3 execution tasks.
+You are an AI Project Manager.
 
-Include:
+Break down the instruction into EXACTLY 3 implementation tasks.
+
+STRICT RULES:
+- Use action verbs: Create, Build, Implement, Develop
+- Do NOT use: Design, Plan, Define, Analyze, Document
+- Tasks must be practical and executable
+- Do NOT assume domain unless specified
+- Avoid abstract tasks
+- Effort must be ONLY: Low, Medium, High
+
+Respond ONLY in JSON array with:
 - task
 - skill
 - priority
-- effort (Low / Medium / High)
-
-Stay within task/workload system.
-No ecommerce/sales assumptions.
-
-JSON only.
+- effort
 """
 
 VAGUE_PROMPT = """
-Generate EXACTLY 3 simple UI tasks.
+You are an AI Project Manager.
 
-No backend, no DB.
+User input is vague.
 
-Include:
+Generate EXACTLY 3 simple implementation tasks.
+
+STRICT RULES:
+- Use action verbs: Create, Build, Implement, Develop
+- Do NOT use: Design, Plan, Define, Analyze
+- Tasks must be simple and executable
+- Effort must be ONLY: Low, Medium, High
+
+Respond ONLY in JSON array with:
 - task
-- skill (Frontend)
-- priority (Medium)
-- effort (Low)
-
-JSON only.
+- skill
+- priority
+- effort
 """
 
 # -------------------------------
@@ -175,78 +194,73 @@ JSON only.
 col1, col2 = st.columns(2)
 
 with col1:
-    st.header("📝 Input")
     user_input = st.text_area("Enter instruction")
-    run = st.button("Analyze")
 
-    st.subheader("👥 Team Status")
+    if user_input.count("\n") >= 2:
+        st.warning("Please enter a single instruction for better results.")
+        st.stop()
+
+    colA, colB = st.columns(2)
+    with colA:
+        run = st.button("Analyze")
+    with colB:
+        if st.button("Reset"):
+            st.session_state.last_input = None
+            st.session_state.cached_tasks = None
+
     st.dataframe(df)
 
-    # 🔥 WORKLOAD DASHBOARD
-    st.subheader("📊 Workload Distribution")
-
-    chart_df = df.copy()
-    chart_df["Used"] = chart_df["CurrentTasks"]
-
-    st.bar_chart(chart_df.set_index("Employee")[["Used", "Capacity"]])
-
-# -------------------------------
-# OUTPUT
-# -------------------------------
 with col2:
     st.header("📊 Execution Plan")
 
     if run:
 
-        is_vague = is_vague_input(user_input)
-        deadline_days = extract_deadline_days(user_input)
+        if user_input == st.session_state.last_input:
+            tasks = st.session_state.cached_tasks
+        else:
+            is_vague = is_vague_input(user_input)
+            prompt = VAGUE_PROMPT if is_vague else MAIN_PROMPT
 
-        prompt = VAGUE_PROMPT if is_vague else MAIN_PROMPT
+            res = client.chat.completions.create(
+                model="meta-llama/llama-3-8b-instruct",
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0
+            )
 
-        res = client.chat.completions.create(
-            model="meta-llama/llama-3-8b-instruct",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_input}
-            ],
-            temperature=0
-        )
+            raw = res.choices[0].message.content
+            match = re.search(r"\[.*\]", raw, re.DOTALL)
+            tasks = json.loads(match.group()) if match else []
 
-        raw = res.choices[0].message.content
-        match = re.search(r"\[.*\]", raw, re.DOTALL)
-        tasks = json.loads(match.group()) if match else []
+            tasks = tasks[:3]
+
+            st.session_state.last_input = user_input
+            st.session_state.cached_tasks = tasks
+
+        tasks = filter_bad_tasks(tasks)
 
         if not tasks:
-            st.error("No tasks generated")
+            st.error("No valid tasks generated")
             st.stop()
 
-        # 🔥 STEP 2 (subtasks logic)
+        is_vague = is_vague_input(user_input)
+
         if not is_vague and len(tasks) > 2:
             subtasks = split_tasks(tasks)
         else:
             subtasks = tasks
 
-        # 🔥 STEP 3 (dependencies)
         subtasks = add_dependencies(subtasks)
 
-        st.success("✅ AI Analysis Complete")
+        for t in subtasks:
+            t["effort"] = normalize_effort(t.get("effort"))
 
-        # 🔥 FEASIBILITY
-        total_hours = sum(effort_to_hours(t.get("effort", "Medium")) for t in subtasks)
-        team_hours = sum((row["Capacity"] - row["CurrentTasks"]) * 4 for _, row in df.iterrows())
-
-        if deadline_days:
-            max_hours = team_hours * deadline_days
-            if total_hours > max_hours:
-                st.error(f"❌ Not feasible ({total_hours}h needed vs {max_hours}h available)")
-            else:
-                st.success(f"✅ Feasible ({total_hours}h vs {max_hours}h)")
-        else:
-            st.info(f"ℹ️ Estimated effort: {total_hours}h")
+        st.success("AI Analysis Complete")
 
         temp_df = df.copy()
 
-        # 🔥 STEP 4 (loop on subtasks)
         for t in subtasks:
 
             skill = correct_skill(t.get("task", ""), t.get("skill", "Frontend"))
@@ -255,18 +269,18 @@ with col2:
             st.markdown(f"### 🔹 {t.get('task')}")
 
             if avail < 0:
-                st.write(f"📊 Capacity Status: Overloaded (+{abs(avail)})")
+                st.write(f"Overloaded (+{abs(avail)})")
             else:
-                st.write(f"📊 Available Capacity: {avail}")
+                st.write(f"Available Capacity: {avail}")
 
-            st.write(f"👤 Assigned to: {emp}")
-            st.write(f"🔥 Priority: {t.get('priority')}")
-            st.write(f"⏱ Effort: {t.get('effort')}")
-            st.write(f"🔗 Depends on: {t.get('depends_on')}")
-            st.write(f"🧠 {reason}")
+            st.write(f"Assigned to: {emp}")
+            st.write(f"Priority: {t.get('priority')}")
+            st.write(f"Effort: {t.get('effort')}")
+            st.write(f"Depends on: {t.get('depends_on')}")
+            st.write(reason)
 
             st.markdown("---")
 
             temp_df.loc[temp_df["Employee"] == emp, "CurrentTasks"] += 1
 
-        st.success(f"✅ {len(subtasks)} tasks processed")
+        st.success(f"{len(subtasks)} tasks processed")
